@@ -271,7 +271,7 @@ int16_t                gLoraLastDlBytes = -1;
 Preferences gPrefs;
 
 // -----------------------------------------------------------------------------
-// RadioLib SX1262 + LoRaWANNode + Instância SPI Secundária
+// RadioLib SX1262 + LoRaWANNode (SPI compartilhado com o W5500)
 // -----------------------------------------------------------------------------
 #define LORA_NSS   14
 #define LORA_SCK   12
@@ -282,9 +282,13 @@ Preferences gPrefs;
 #define LORA_DIO1  45
 #define LORA_INT   45
 
-// Instanciamos um barramento SPI separado para o SX1262 para evitar conflito com o W5500
-SPIClass loraSPI(HSPI);
-SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
+// W5500 e SX1262 compartilham o MESMO barramento SPI fisico (SCK=12, MOSI=11,
+// MISO=13), cada um com seu proprio CS. Por isso AMBOS usam a unica instancia
+// global `SPI`. NAO instanciar um segundo SPIClass nos mesmos pinos: na ESP32
+// um pino de saida (SCK/MOSI) so pode ser roteado para um periferico SPI por
+// vez (GPIO matrix), entao o segundo begin() "rouba" os pinos e o W5500 deixa
+// de receber clock — causa do "hardwareStatus=0 / W5500 not detected".
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, SPI);
 
 // AU915, sub-band 1 (canais 0-7) per Everynet/AllCom AllManager Brasil.
 const LoRaWANBand_t Region   = AU915;
@@ -965,10 +969,9 @@ void setup() {
     pinMode(LORA_NSS, OUTPUT);
     digitalWrite(LORA_NSS, HIGH);
 
-    // SPIs separadas para a V3.
-    Serial.println(F("[BOOT] Configurando barramentos SPI (W5500 e LoRa)")); Serial.flush();
+    // Barramento SPI unico, compartilhado por W5500 e SX1262 (mesmos pinos).
+    Serial.println(F("[BOOT] Configurando barramento SPI compartilhado (W5500 + LoRa)")); Serial.flush();
     SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN);
-    loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
 
 #if BYPASS_SNMP
     Serial.println(F("[BYPASS] W5500 + SNMP disabled — synthetic data path"));

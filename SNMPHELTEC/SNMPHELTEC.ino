@@ -198,6 +198,8 @@ SNMPManager    gSnmp(SNMP_COMMUNITY);
 SNMPGet        gReq(SNMP_COMMUNITY, SNMP_VERSION_V1);
 ValueCallback* gCb[13]      = { nullptr };
 int            gValues[13]  = { 0 };
+int            gLastValidValues[13] = { 0 };  // ultimo snapshot 13/13 valido (botao manual)
+bool           gHaveValidSnmp       = false;  // true apos a 1a coleta SNMP valida
 #if USE_TEMP_SENSOR
 OneWire           gOneWire(DS18B20_PIN);
 DallasTemperature gTempSensor(&gOneWire);
@@ -330,6 +332,7 @@ static void udpRefresh();
 #endif
 static bool criticalChanged();
 static void handleCriticalAndUplink();
+static void handleButton();
 
 // =============================================================================
 // LEDs de status — WS2812 (RGB enderecavel) via FastLED
@@ -397,6 +400,31 @@ static void ledFatalOn() {
 }
 
 // =============================================================================
+// Botao de envio manual (GPIO39, pull-up interno)
+// =============================================================================
+// Botao entre GPIO39 e GND. Com INPUT_PULLUP o pino fica em HIGH e vai a LOW
+// quando pressionado -> interrupcao na borda de descida (FALLING) seta a flag.
+// O envio (bloqueante, confirmado) acontece no loop(), nunca dentro da ISR.
+// Obs.: no ESP32-S3 o GPIO39 TEM pull-up interno (diferente do ESP32 classico,
+// onde GPIO34-39 sao apenas-entrada e sem pull).
+#define BUTTON_PIN              39
+#define BUTTON_MIN_INTERVAL_MS  2000UL   // anti-repique entre acionamentos
+
+volatile bool gButtonEvent         = false;  // setada pela ISR ao pressionar
+uint32_t      gButtonLastHandledMs = 0;      // ultimo acionamento tratado (millis)
+
+void IRAM_ATTR buttonIsr() {
+    gButtonEvent = true;                      // minimo na ISR; debounce no loop()
+}
+
+static void buttonSetup() {
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonIsr, FALLING);
+    Serial.printf("[BTN] GPIO%u armado (pull-up interno, borda de descida)\n",
+                  (unsigned)BUTTON_PIN);
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 static int16_t clampToI16(int32_t v, const char* tag) {
@@ -411,11 +439,11 @@ static int16_t clampToI16(int32_t v, const char* tag) {
     return (int16_t)v;
 }
 
-static void buildPayload() {
+static void buildPayload(const int* vals) {
     Serial.println(F("[POLL] SNMP values:"));
     for (int i = 0; i < 13; i++) {
-        Serial.printf("  [%2d] %-30s = %d\n", i, OID_NAMES[i], gValues[i]);
-        int16_t v = clampToI16((int32_t)gValues[i], OID_NAMES[i]);
+        Serial.printf("  [%2d] %-30s = %d\n", i, OID_NAMES[i], vals[i]);
+        int16_t v = clampToI16((int32_t)vals[i], OID_NAMES[i]);
         gPayload[i * 2]     = (uint8_t)((v >> 8) & 0xFF);   // big-endian
         gPayload[i * 2 + 1] = (uint8_t)(v & 0xFF);
     }
@@ -644,7 +672,7 @@ static void loraSetup() {
 }
 
 static void loraSendUplink(bool isCritical) {
-    const uint8_t maxAttempts = isCritical ? 3 : 1;
+    const uint8_t maxAttempts = isCritical ? 5 : 1;   // confirmado (critico/botao): 5 tentativas
 
     for (uint8_t att = 1; att <= maxAttempts; att++) {
         if (isCritical) {
@@ -705,7 +733,7 @@ static void loraSendUplink(bool isCritical) {
                       (unsigned)att, (unsigned)maxAttempts);
     }
 
-    Serial.println(F("[EVT] ACK FAIL after 3 attempts — giving up"));
+    Serial.printf("[EVT] ACK FAIL after %u attempts — giving up\n", (unsigned)maxAttempts);
 }
 
 static void loraSaveSession() {
@@ -894,6 +922,11 @@ static bool criticalChanged() {
 }
 
 static void handleCriticalAndUplink() {
+    // gValues aqui representam uma coleta valida (13/13 real ou sintetica em
+    // BYPASS). Guardamos o snapshot para o envio manual via botao (GPIO39).
+    memcpy(gLastValidValues, gValues, sizeof(gLastValidValues));
+    gHaveValidSnmp = true;
+
     const bool     changed   = criticalChanged();
     const uint32_t now       = millis();
     const bool     heartbeat = (gLastUplinkMs == 0) ||
@@ -903,14 +936,14 @@ static void handleCriticalAndUplink() {
 
     if (heartbeat) {
         Serial.println(F("[UPLINK] heartbeat 60s"));
-        buildPayload();
+        buildPayload(gValues);
         loraSendUplink();
 #if !BYPASS_SNMP
         udpRefresh();
 #endif
     } else if (changed && rateOk) {
         Serial.println(F("[UPLINK] EVT critical change (confirmed)"));
-        buildPayload();
+        buildPayload(gValues);
         loraSendUplink(/*isCritical=*/true);
 #if !BYPASS_SNMP
         udpRefresh();
@@ -918,6 +951,39 @@ static void handleCriticalAndUplink() {
     } else if (changed) {
         Serial.println(F("[UPLINK] critical changed but rate-limited — skipping TX"));
     }
+}
+
+// =============================================================================
+// Botao: envio manual sob demanda (confirmado, 5 tentativas)
+// =============================================================================
+// Dispara um uplink LoRaWAN CONFIRMADO com o ultimo snapshot SNMP valido.
+// Chamado pelo loop() fora da janela de resposta SNMP. O envio e bloqueante
+// (ate 5 tentativas), por isso a flag so e limpa no fim, descartando repiques
+// ou novos toques ocorridos durante a transmissao.
+static void handleButton() {
+    if (!gButtonEvent) return;
+
+    const uint32_t now = millis();
+    if (gButtonLastHandledMs != 0 &&
+        (uint32_t)(now - gButtonLastHandledMs) < BUTTON_MIN_INTERVAL_MS) {
+        gButtonEvent = false;                 // repique dentro da janela: ignora
+        return;
+    }
+
+    if (!gHaveValidSnmp) {
+        Serial.println(F("[BTN] pressionado, mas ainda sem coleta SNMP valida — ignorado"));
+        gButtonEvent = false;
+        return;
+    }
+
+    gButtonLastHandledMs = now;
+    Serial.println(F("[BTN] pressionado — uplink CONFIRMADO com ultimos dados validos"));
+    buildPayload(gLastValidValues);
+    loraSendUplink(/*isCritical=*/true);      // confirmado, 5 tentativas
+#if !BYPASS_SNMP
+    udpRefresh();
+#endif
+    gButtonEvent = false;                     // descarta eventos ocorridos durante o envio
 }
 
 // =============================================================================
@@ -1076,6 +1142,8 @@ void setup() {
 
     randomSeed(esp_random());
 
+    buttonSetup();
+
     gNextPollMs = millis() + 5000UL;
 #if USE_TEMP_SENSOR
     gNextTempPollMs = millis() + 3000UL;
@@ -1157,6 +1225,12 @@ void loop() {
         tempPoll();
     }
 #endif
+
+    // Botao manual (GPIO39): trata fora da janela de resposta SNMP para nao
+    // atropelar um poll em andamento. A flag e setada pela ISR.
+    if (!gSendPending) {
+        handleButton();
+    }
 
 //    if ((int32_t)(now - gOledNextDrawMs) >= 0) {
 //        gOledNextDrawMs = now + 500UL;

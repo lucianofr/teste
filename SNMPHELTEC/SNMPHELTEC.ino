@@ -330,6 +330,69 @@ static bool criticalChanged();
 static void handleCriticalAndUplink();
 
 // =============================================================================
+// LEDs de status
+// =============================================================================
+// 4 LEDs discretos no hardware (pinos informados pelo usuario):
+//   46  heartbeat   — loop principal vivo (1 s aceso / 1 s apagado)
+//    3  LoRa TX     — pisca rapido a cada uplink LoRaWAN enviado
+//   21  SNMP poll   — pisca rapido a cada polling SNMP
+//   41  erro fatal  — aceso continuo quando ocorre um erro fatal
+// LED_ACTIVE_HIGH=1 -> nivel ALTO no GPIO acende o LED. Mude para 0 se os
+// seus LEDs forem ativos em nivel baixo (catodo no GPIO, anodo no 3V3).
+#define LED_HEARTBEAT_PIN  46
+#define LED_LORA_PIN        3
+#define LED_SNMP_PIN       21
+#define LED_FATAL_PIN      41
+#define LED_ACTIVE_HIGH     1
+
+static inline void ledWrite(uint8_t pin, bool on) {
+#if LED_ACTIVE_HIGH
+    digitalWrite(pin, on ? HIGH : LOW);
+#else
+    digitalWrite(pin, on ? LOW : HIGH);
+#endif
+}
+
+static void ledSetup() {
+    const uint8_t pins[4] = {
+        LED_HEARTBEAT_PIN, LED_LORA_PIN, LED_SNMP_PIN, LED_FATAL_PIN
+    };
+    for (uint8_t i = 0; i < 4; i++) {
+        pinMode(pins[i], OUTPUT);
+        ledWrite(pins[i], false);          // todos apagados no boot
+    }
+    Serial.println(F("[LED] pinos 46(hb)/3(lora)/21(snmp)/41(fatal) prontos"));
+}
+
+// Heartbeat nao-bloqueante: alterna o LED 46 a cada 1 s (1 s on / 1 s off).
+static void ledHeartbeatTask() {
+    static uint32_t nextMs = 0;
+    static bool     state  = false;
+    const uint32_t now = millis();
+    if ((int32_t)(now - nextMs) >= 0) {
+        state  = !state;
+        ledWrite(LED_HEARTBEAT_PIN, state);
+        nextMs = now + 1000UL;
+    }
+}
+
+// Pisca rapido (bloqueante, poucos ms) para sinalizar um evento pontual.
+static void ledFlash(uint8_t pin, uint8_t times, uint16_t ms) {
+    for (uint8_t i = 0; i < times; i++) {
+        ledWrite(pin, true);
+        delay(ms);
+        ledWrite(pin, false);
+        if (i + 1 < times) delay(ms);
+    }
+    esp_task_wdt_reset();                   // flash curto, mas nao deixa o WDT estourar
+}
+
+// Acende o LED de erro fatal (continuo ate o reboot).
+static void ledFatalOn() {
+    ledWrite(LED_FATAL_PIN, true);
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 static int16_t clampToI16(int32_t v, const char* tag) {
@@ -421,6 +484,7 @@ static void tempPoll() {
         if (++gTempFailCount >= TEMP_MAX_CONSEC_FAILS) {
             Serial.printf("[TEMP] FATAL: %u consecutive invalid reads — esp_restart()\n",
                           (unsigned)gTempFailCount);
+            ledFatalOn();
             Serial.flush();
             delay(50);
             esp_restart();
@@ -534,6 +598,7 @@ static void loraSetup() {
     int16_t state = radio.begin();
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("[RL] FATAL radio.begin failed code=%d\n", (int)state);
+        ledFatalOn();
         while (true) { delay(1000); }
     }
 
@@ -545,6 +610,7 @@ static void loraSetup() {
     state = node.beginABP(DEVADDR, NULL, NULL, NWKSKEY, APPSKEY);
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("[RL] FATAL beginABP failed code=%d\n", (int)state);
+        ledFatalOn();
         while (true) { delay(1000); }
     }
 
@@ -561,6 +627,7 @@ static void loraSetup() {
                       (unsigned long)node.getFCntUp());
     } else {
         Serial.printf("[RL] FATAL activateABP returned %d\n", (int)state);
+        ledFatalOn();
         while (true) { delay(1000); }
     }
 
@@ -608,6 +675,7 @@ static void loraSendUplink(bool isCritical) {
         gLoraDoneCount++;
         gLoraLastDoneMs  = millis();
         gLastUplinkMs    = gLoraLastDoneMs;
+        ledFlash(LED_LORA_PIN, 3, 40);      // LED 3: sinaliza uplink enviado
 
         if (state > 0) {
             Serial.printf("[RL] downlink received in RX%u\n", (unsigned)state);
@@ -958,6 +1026,8 @@ void setup() {
     Serial.printf("AppEUI:  %016llX\n", (unsigned long long)JOINEUI);
     Serial.printf("DevAddr: %08lX\n",   (unsigned long)DEVADDR);
 
+    ledSetup();
+
     wdtInit();
 
 //    Serial.println(F("[BOOT] oledInit")); Serial.flush();
@@ -978,6 +1048,7 @@ void setup() {
     gSnmpState = SNMP_S_OK;
 #else
     if (!ethernetInit()) {
+        ledFatalOn();
         while (true) { delay(1000); }
     }
     Serial.println(F("[BOOT] snmpSetup()")); Serial.flush();
@@ -1011,6 +1082,7 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+    ledHeartbeatTask();                     // LED 46: prova de vida do loop
 
 #if !BYPASS_SNMP
     gSnmp.loop();
@@ -1034,6 +1106,7 @@ void loop() {
 
     if ((int32_t)(now - gNextPollMs) >= 0) {
         gNextPollMs = now + SNMP_POLL_INTERVAL_MS;
+        ledFlash(LED_SNMP_PIN, 2, 40);      // LED 21: sinaliza polling SNMP
 #if BYPASS_SNMP
         fakeFillValues();
         gSnmpState     = SNMP_S_OK;
@@ -1065,6 +1138,7 @@ void loop() {
             if (gConsecFails >= SNMP_RESTART_AFTER_FAILS) {
                 Serial.printf("[ETH] %u consecutive failures — esp_restart()\n",
                               (unsigned)gConsecFails);
+                ledFatalOn();
                 Serial.flush();
                 delay(50);
                 esp_restart();

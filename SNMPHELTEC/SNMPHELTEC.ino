@@ -19,7 +19,7 @@
  * 2. Tools -> Board -> "ESP32S3 Dev Module".
  * 3. Library Manager — install:
  * - "RadioLib"                             by Jan Gromes        (>= 7.0.0)
- * - "Ethernet3"                            by sstaub (v1.6.x)
+ * - "Ethernet2"                            by Adafruit / Various (W5500)
  * - "Arduino_SNMP_Manager"                 by shortbloke
  * - "U8g2"                                 by olikraus          (>= 2.34)
  *
@@ -32,16 +32,15 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-// sstaub/Ethernet3 (v1.6.x): drives the W5500 via its 8 hardware sockets
-// directly — no LWIP, no MACRAW. Replaces EthernetESP32 which was dropping
-// ~10% of UDP responses (firstResp=-1) on this hardware; root cause was
-// inside the W5500-MACRAW <-> LWIP stack. Native sockets sidestep the whole
-// problem. Configured with init(1) so the single UDP socket we need owns all
-// 16 KB of the W5500's internal RX/TX buffer (huge headroom vs default 2 KB).
-// INT pin (-1, not wired) is irrelevant — this lib polls W5500 status
-// registers over SPI on demand.
-#include <Ethernet3.h>
-#include <EthernetUdp3.h>
+// adafruit/Ethernet2: lightweight W5500 driver that talks to the chip's 8
+// hardware sockets directly — no LWIP, no MACRAW. Ethernet.init(cs) selects
+// the W5500 chip-select pin; the RSTn line is pulsed manually in
+// w5500HardReset() (this lib has no setRstPin()). begin() argument order is
+// (mac, ip, dns, gateway, subnet) — note this differs from Ethernet3's
+// (mac, ip, subnet, gateway, dns). The lib polls the W5500 status registers
+// over SPI on demand, so the INT pin (not wired) is irrelevant.
+#include <Ethernet2.h>
+#include <EthernetUdp2.h>
 #include <Arduino_SNMP_Manager.h>
 #include <RadioLib.h>
 #include <Wire.h>
@@ -319,6 +318,7 @@ static void loraSaveSession();
 static void loraRestoreSession();
 static void wdtInit();
 #if !BYPASS_SNMP
+static bool ethLinkUp();
 static bool ethernetInit();
 static void udpRefresh();
 #endif
@@ -509,7 +509,7 @@ static void snmpEvaluate() {
     if (recv != 13) {
 #if !BYPASS_SNMP
         Serial.printf("[DIAG] link=%s heapFree=%u heapLargest=%u remoteIP=%u.%u.%u.%u\n",
-                      Ethernet.link() ? "UP" : "DOWN",
+                      ethLinkUp() ? "UP" : "DOWN",
                       (unsigned)ESP.getFreeHeap(),
                       (unsigned)ESP.getMaxAllocHeap(),
                       SNMP_TARGET_IP[0], SNMP_TARGET_IP[1],
@@ -744,6 +744,12 @@ static void wdtInit() {
 // Ethernet (W5500) init / reinit
 // =============================================================================
 #if !BYPASS_SNMP
+// Ethernet2 has no Ethernet.link(). Bit0 (LNK) of the W5500 PHYCFGR register
+// (0x002E) is the live PHY link state — 1 = up, 0 = down.
+static bool ethLinkUp() {
+    return (w5500.getPHYCFGR() & 0x01) != 0;
+}
+
 static void w5500HardReset() {
     pinMode(W5500_RST_PIN, OUTPUT);
     digitalWrite(W5500_RST_PIN, HIGH);
@@ -758,15 +764,14 @@ static bool ethernetInit() {
     Serial.println(F("[ETH] W5500 hardware reset")); Serial.flush();
     w5500HardReset();
 
-    Serial.println(F("[ETH] Ethernet3 setCsPin/setRstPin + init(1) + begin")); Serial.flush();
-    Ethernet.setCsPin(W5500_CS_PIN);
-    Ethernet.setRstPin(W5500_RST_PIN);
-    Ethernet.init(1);
+    Serial.println(F("[ETH] Ethernet2 init(cs) + begin")); Serial.flush();
+    Ethernet.init(W5500_CS_PIN);
 
-    Ethernet.begin(MAC_ADDR, LOCAL_IP, SUBNET_MASK, GATEWAY_IP, DNS_IP);
+    // Ethernet2 begin() order: (mac, ip, dns, gateway, subnet)
+    Ethernet.begin(MAC_ADDR, LOCAL_IP, DNS_IP, GATEWAY_IP, SUBNET_MASK);
 
-    // Ethernet3's internal w5500::init() calls SPI.begin() with no arguments,
-    // which pode resetar os pinos. Re-aplicamos o mapeamento do W5500 aqui.
+    // Ethernet2's internal w5500::init() may call SPI.begin() with no
+    // arguments, which pode resetar os pinos. Re-aplicamos o mapeamento aqui.
     SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN);
 
     Serial.printf("[ETH] W5500 readVersion=0x%02X (expect 0x04)\n",
@@ -776,7 +781,7 @@ static bool ethernetInit() {
         Serial.println(F("[ETH] FATAL: W5500 not detected (localIP=0.0.0.0)"));
         return false;
     }
-    if (!Ethernet.link()) {
+    if (!ethLinkUp()) {
         Serial.println(F("[ETH] WARN: link DOWN (check cable)"));
     }
     Serial.print(F("[ETH] local IP = ")); Serial.println(Ethernet.localIP());
@@ -899,7 +904,7 @@ static void oledDraw() {
     gDisp.drawStr(0, 22, "BYPASS  no W5500");
 #else
     IPAddress ip = Ethernet.localIP();
-    bool linkUp  = (Ethernet.link() != 0);
+    bool linkUp  = ethLinkUp();
     snprintf(buf, sizeof(buf), "ETH %u.%u.%u.%u %s",
              ip[0], ip[1], ip[2], ip[3], linkUp ? "UP" : "DN");
     gDisp.drawStr(0, 22, buf);

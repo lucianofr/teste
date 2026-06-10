@@ -49,6 +49,8 @@
 #include <esp_system.h>            // esp_restart()
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"         // xTaskGetIdleTaskHandleForCPU() (core 2.x WDT)
+#define FASTLED_INTERNAL           // silencia o #pragma de versao do FastLED no build
+#include <FastLED.h>               // LEDs de status WS2812 (RGB enderecavel) — v3.6.0
 
 
 
@@ -330,66 +332,68 @@ static bool criticalChanged();
 static void handleCriticalAndUplink();
 
 // =============================================================================
-// LEDs de status
+// LEDs de status — WS2812 (RGB enderecavel) via FastLED
 // =============================================================================
-// 4 LEDs discretos no hardware (pinos informados pelo usuario):
-//   46  heartbeat   — loop principal vivo (1 s aceso / 1 s apagado)
-//    3  LoRa TX     — pisca rapido a cada uplink LoRaWAN enviado
-//   21  SNMP poll   — pisca rapido a cada polling SNMP
-//   41  erro fatal  — aceso continuo quando ocorre um erro fatal
-// LED_ACTIVE_HIGH=1 -> nivel ALTO no GPIO acende o LED. Mude para 0 se os
-// seus LEDs forem ativos em nivel baixo (catodo no GPIO, anodo no 3V3).
-#define LED_HEARTBEAT_PIN  46
-#define LED_LORA_PIN        3
-#define LED_SNMP_PIN       21
-#define LED_FATAL_PIN      41
-#define LED_ACTIVE_HIGH     1
+// 4 WS2812 independentes, um por pino de dados (informados pelo hardware):
+//   46  heartbeat   — VERDE,    1 s on / 1 s off (loop principal vivo)
+//    3  LoRa TX     — AZUL,     pisca rapido a cada uplink LoRaWAN enviado
+//   21  SNMP poll   — AMBAR,    pisca rapido a cada polling SNMP
+//   41  erro fatal  — VERMELHO, aceso continuo quando ocorre um erro fatal
+//
+// WS2812 e enderecavel (protocolo serial de 1 fio): NAO se usa digitalWrite().
+// O FastLED gera o timing pelo periferico RMT do ESP32-S3 (um canal RMT por
+// pino). Os pinos sao constantes de compilacao — exigencia do template
+// addLeds<>. Cor trocada? WS2812B usa ordem GRB; mude LED_ORDER para RGB.
+#define LED_HB_PIN     46
+#define LED_LORA_PIN    3
+#define LED_SNMP_PIN   21
+#define LED_FATAL_PIN  41
+#define LED_ORDER      GRB         // ordem de cor do WS2812B (troque p/ RGB se necessario)
+#define LED_BRIGHTNESS 40          // 0-255 (WS2812 a 255 e ofuscante e puxa ~60 mA/LED)
 
-static inline void ledWrite(uint8_t pin, bool on) {
-#if LED_ACTIVE_HIGH
-    digitalWrite(pin, on ? HIGH : LOW);
-#else
-    digitalWrite(pin, on ? LOW : HIGH);
-#endif
-}
+static CRGB gLedHb[1];
+static CRGB gLedLora[1];
+static CRGB gLedSnmp[1];
+static CRGB gLedFatal[1];
 
 static void ledSetup() {
-    const uint8_t pins[4] = {
-        LED_HEARTBEAT_PIN, LED_LORA_PIN, LED_SNMP_PIN, LED_FATAL_PIN
-    };
-    for (uint8_t i = 0; i < 4; i++) {
-        pinMode(pins[i], OUTPUT);
-        ledWrite(pins[i], false);          // todos apagados no boot
-    }
-    Serial.println(F("[LED] pinos 46(hb)/3(lora)/21(snmp)/41(fatal) prontos"));
+    FastLED.addLeds<WS2812B, LED_HB_PIN,    LED_ORDER>(gLedHb,    1);
+    FastLED.addLeds<WS2812B, LED_LORA_PIN,  LED_ORDER>(gLedLora,  1);
+    FastLED.addLeds<WS2812B, LED_SNMP_PIN,  LED_ORDER>(gLedSnmp,  1);
+    FastLED.addLeds<WS2812B, LED_FATAL_PIN, LED_ORDER>(gLedFatal, 1);
+    FastLED.setBrightness(LED_BRIGHTNESS);
+    gLedHb[0] = gLedLora[0] = gLedSnmp[0] = gLedFatal[0] = CRGB::Black;
+    FastLED.show();
+    Serial.println(F("[LED] WS2812/FastLED: 46(hb)/3(lora)/21(snmp)/41(fatal) prontos"));
 }
 
-// Heartbeat nao-bloqueante: alterna o LED 46 a cada 1 s (1 s on / 1 s off).
+// Heartbeat nao-bloqueante: LED 46 alterna VERDE a cada 1 s (1 s on / 1 s off).
 static void ledHeartbeatTask() {
     static uint32_t nextMs = 0;
-    static bool     state  = false;
+    static bool     on     = false;
     const uint32_t now = millis();
     if ((int32_t)(now - nextMs) >= 0) {
-        state  = !state;
-        ledWrite(LED_HEARTBEAT_PIN, state);
+        on = !on;
+        gLedHb[0] = on ? CRGB::Green : CRGB::Black;
+        FastLED.show();
         nextMs = now + 1000UL;
     }
 }
 
-// Pisca rapido (bloqueante, poucos ms) para sinalizar um evento pontual.
-static void ledFlash(uint8_t pin, uint8_t times, uint16_t ms) {
+// Pisca rapido (bloqueante, poucos ms) um LED para sinalizar um evento pontual.
+static void ledFlash(CRGB* led, const CRGB& color, uint8_t times, uint16_t ms) {
     for (uint8_t i = 0; i < times; i++) {
-        ledWrite(pin, true);
-        delay(ms);
-        ledWrite(pin, false);
+        led[0] = color;       FastLED.show(); delay(ms);
+        led[0] = CRGB::Black; FastLED.show();
         if (i + 1 < times) delay(ms);
     }
     esp_task_wdt_reset();                   // flash curto, mas nao deixa o WDT estourar
 }
 
-// Acende o LED de erro fatal (continuo ate o reboot).
+// Acende o LED de erro fatal em VERMELHO continuo (ate o reboot).
 static void ledFatalOn() {
-    ledWrite(LED_FATAL_PIN, true);
+    gLedFatal[0] = CRGB::Red;
+    FastLED.show();
 }
 
 // =============================================================================
@@ -675,7 +679,7 @@ static void loraSendUplink(bool isCritical) {
         gLoraDoneCount++;
         gLoraLastDoneMs  = millis();
         gLastUplinkMs    = gLoraLastDoneMs;
-        ledFlash(LED_LORA_PIN, 3, 40);      // LED 3: sinaliza uplink enviado
+        ledFlash(gLedLora, CRGB::Blue, 3, 40);     // LED 3: uplink enviado (azul)
 
         if (state > 0) {
             Serial.printf("[RL] downlink received in RX%u\n", (unsigned)state);
@@ -1106,7 +1110,7 @@ void loop() {
 
     if ((int32_t)(now - gNextPollMs) >= 0) {
         gNextPollMs = now + SNMP_POLL_INTERVAL_MS;
-        ledFlash(LED_SNMP_PIN, 2, 40);      // LED 21: sinaliza polling SNMP
+        ledFlash(gLedSnmp, CRGB::Orange, 2, 40);   // LED 21: polling SNMP (ambar)
 #if BYPASS_SNMP
         fakeFillValues();
         gSnmpState     = SNMP_S_OK;

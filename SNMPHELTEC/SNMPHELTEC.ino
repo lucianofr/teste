@@ -19,7 +19,7 @@
  * 2. Tools -> Board -> "ESP32S3 Dev Module".
  * 3. Library Manager — install:
  * - "RadioLib"                             by Jan Gromes        (>= 7.0.0)
- * - "Ethernet2"                            by Adafruit / Various (W5500)
+ * - "Ethernet"                             by Arduino (>= 2.0.0, W5500)
  * - "Arduino_SNMP_Manager"                 by shortbloke
  * - "U8g2"                                 by olikraus          (>= 2.34)
  *
@@ -32,15 +32,15 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-// adafruit/Ethernet2: lightweight W5500 driver that talks to the chip's 8
-// hardware sockets directly — no LWIP, no MACRAW. Ethernet.init(cs) selects
-// the W5500 chip-select pin; the RSTn line is pulsed manually in
-// w5500HardReset() (this lib has no setRstPin()). begin() argument order is
-// (mac, ip, dns, gateway, subnet) — note this differs from Ethernet3's
-// (mac, ip, subnet, gateway, dns). The lib polls the W5500 status registers
-// over SPI on demand, so the INT pin (not wired) is irrelevant.
-#include <Ethernet2.h>
-#include <EthernetUdp2.h>
+// Official Arduino Ethernet library (arduino-libraries/Ethernet, >= 2.0.0):
+// supports the W5500 over the chip's 8 hardware sockets. Ethernet.init(cs)
+// selects the chip-select pin; the RSTn line is pulsed manually in
+// w5500HardReset() (this lib has no reset-pin API). begin() argument order is
+// (mac, ip, dns, gateway, subnet). Link/chip state come from the public
+// Ethernet.linkStatus() / Ethernet.hardwareStatus() helpers — there is no
+// global w5500 object here as there was in Ethernet2/Ethernet3.
+#include <Ethernet.h>
+#include <EthernetUdp.h>
 #include <Arduino_SNMP_Manager.h>
 #include <RadioLib.h>
 #include <Wire.h>
@@ -744,10 +744,10 @@ static void wdtInit() {
 // Ethernet (W5500) init / reinit
 // =============================================================================
 #if !BYPASS_SNMP
-// Ethernet2 has no Ethernet.link(). Bit0 (LNK) of the W5500 PHYCFGR register
-// (0x002E) is the live PHY link state — 1 = up, 0 = down.
+// The Arduino Ethernet lib reports link state via linkStatus() (LinkON /
+// LinkOFF / Unknown). For the W5500 this reflects the PHY LNK bit.
 static bool ethLinkUp() {
-    return (w5500.getPHYCFGR() & 0x01) != 0;
+    return Ethernet.linkStatus() == LinkON;
 }
 
 static void w5500HardReset() {
@@ -764,18 +764,22 @@ static bool ethernetInit() {
     Serial.println(F("[ETH] W5500 hardware reset")); Serial.flush();
     w5500HardReset();
 
-    Serial.println(F("[ETH] Ethernet2 init(cs) + begin")); Serial.flush();
+    Serial.println(F("[ETH] Ethernet init(cs) + begin")); Serial.flush();
     Ethernet.init(W5500_CS_PIN);
 
-    // Ethernet2 begin() order: (mac, ip, dns, gateway, subnet)
+    // Ethernet begin() order: (mac, ip, dns, gateway, subnet)
     Ethernet.begin(MAC_ADDR, LOCAL_IP, DNS_IP, GATEWAY_IP, SUBNET_MASK);
 
-    // Ethernet2's internal w5500::init() may call SPI.begin() with no
-    // arguments, which pode resetar os pinos. Re-aplicamos o mapeamento aqui.
+    // The Ethernet lib's internal W5100/W5500 init() may call SPI.begin() with
+    // no arguments, which pode resetar os pinos. Re-aplicamos o mapeamento aqui.
     SPI.begin(W5500_SCK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN);
 
-    Serial.printf("[ETH] W5500 readVersion=0x%02X (expect 0x04)\n",
-                  w5500.readVersion());
+    EthernetHardwareStatus hw = Ethernet.hardwareStatus();
+    Serial.printf("[ETH] hardwareStatus=%d (EthernetW5500=%d expected)\n",
+                  (int)hw, (int)EthernetW5500);
+    if (hw == EthernetNoHardware) {
+        Serial.println(F("[ETH] WARN: no W5x00 detected over SPI"));
+    }
 
     if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
         Serial.println(F("[ETH] FATAL: W5500 not detected (localIP=0.0.0.0)"));

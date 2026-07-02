@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -42,23 +43,30 @@ def run_single_query(
 ) -> bool:
     """Run a single query and return whether the skill was triggered.
 
-    Creates a command file in .claude/commands/ so it appears in Claude's
-    available_skills list, then runs `claude -p` with the raw query.
+    Creates a temporary skill folder (.claude/skills/<name>/SKILL.md) so it
+    appears in Claude's available `skills` list, then runs `claude -p` with
+    the raw query. A flat file under .claude/commands/ only registers as a
+    slash command in this Claude Code version, NOT as an invocable Skill, so
+    the Skill tool never fires for it -- it must be a folder under
+    .claude/skills/ with a SKILL.md that has name+description frontmatter.
     Uses --include-partial-messages to detect triggering early from
     stream events (content_block_start) rather than waiting for the
     full assistant message, which only arrives after tool execution.
     """
     unique_id = uuid.uuid4().hex[:8]
-    clean_name = f"{skill_name}-skill-{unique_id}"
-    project_commands_dir = Path(project_root) / ".claude" / "commands"
-    command_file = project_commands_dir / f"{clean_name}.md"
+    name_prefix = f"{skill_name}-skill-"
+    clean_name = f"{name_prefix}{unique_id}"
+    project_skills_dir = Path(project_root) / ".claude" / "skills"
+    skill_dir = project_skills_dir / clean_name
+    command_file = skill_dir / "SKILL.md"
 
     try:
-        project_commands_dir.mkdir(parents=True, exist_ok=True)
+        skill_dir.mkdir(parents=True, exist_ok=True)
         # Use YAML block scalar to avoid breaking on quotes in description
         indented_desc = "\n  ".join(skill_description.split("\n"))
         command_content = (
             f"---\n"
+            f"name: {clean_name}\n"
             f"description: |\n"
             f"  {indented_desc}\n"
             f"---\n\n"
@@ -144,12 +152,12 @@ def run_single_query(
                             delta = se.get("delta", {})
                             if delta.get("type") == "input_json_delta":
                                 accumulated_json += delta.get("partial_json", "")
-                                if clean_name in accumulated_json:
+                                if name_prefix in accumulated_json:
                                     return True
 
                         elif se_type in ("content_block_stop", "message_stop"):
                             if pending_tool_name:
-                                return clean_name in accumulated_json
+                                return name_prefix in accumulated_json
                             if se_type == "message_stop":
                                 return False
 
@@ -161,9 +169,9 @@ def run_single_query(
                                 continue
                             tool_name = content_item.get("name", "")
                             tool_input = content_item.get("input", {})
-                            if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
+                            if tool_name == "Skill" and name_prefix in tool_input.get("skill", ""):
                                 triggered = True
-                            elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
+                            elif tool_name == "Read" and name_prefix in tool_input.get("file_path", ""):
                                 triggered = True
                             return triggered
 
@@ -177,8 +185,8 @@ def run_single_query(
 
         return triggered
     finally:
-        if command_file.exists():
-            command_file.unlink()
+        if skill_dir.exists():
+            shutil.rmtree(skill_dir, ignore_errors=True)
 
 
 def run_eval(

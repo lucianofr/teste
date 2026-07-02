@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .claude/commands/
+.claude/skills/*-skill-*/
+.claude/skills-backup-*/
